@@ -215,6 +215,33 @@ impl From<ChipType> for [u8; 2] {
     }
 }
 
+/// BM13xx chip profile used for chip-specific initialization and response
+/// decoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChipProfile {
+    /// BM1366, used by Antminer S19XP hashboards.
+    BM1366,
+    /// BM1370, used by Bitaxe Gamma and S21-family captures currently covered
+    /// by the default codec behavior.
+    BM1370,
+}
+
+impl ChipProfile {
+    pub const fn chip_type(self) -> ChipType {
+        match self {
+            Self::BM1366 => ChipType::BM1366,
+            Self::BM1370 => ChipType::BM1370,
+        }
+    }
+
+    pub const fn response_profile(self) -> ResponseProfile {
+        match self {
+            Self::BM1366 => ResponseProfile::BM1366,
+            Self::BM1370 => ResponseProfile::BM1370,
+        }
+    }
+}
+
 /// Nonce range configuration for work distribution.
 ///
 /// NOTE: We store this as a byte array rather than interpreting it as a u32
@@ -262,6 +289,17 @@ impl NonceRangeConfig {
     pub fn from_raw(value: u32) -> Self {
         Self {
             bytes: value.to_le_bytes(),
+        }
+    }
+
+    /// Create config from the human-readable register value used in hardware
+    /// notes and ESP-Miner constants.
+    ///
+    /// For example, S19XP LuxOS uses register value `0x00001446`, transmitted
+    /// on the wire as bytes `00 00 14 46`.
+    pub fn from_register_value(value: u32) -> Self {
+        Self {
+            bytes: value.to_be_bytes(),
         }
     }
 }
@@ -440,6 +478,15 @@ impl IoDriverStrength {
         // 0x1111f100 = 0001 0001 0001 0001 1111 0001 0000 0000
         Self {
             strengths: [0x0, 0x0, 0x1, 0xf, 0x1, 0x1, 0x1, 0x1],
+        }
+    }
+
+    /// BM1366 normal chain drive strength from ESP-Miner S19XP init.
+    ///
+    /// Encodes to wire bytes `02 11 11 11`.
+    pub fn bm1366_normal() -> Self {
+        Self {
+            strengths: [0x2, 0x0, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1],
         }
     }
 }
@@ -1041,6 +1088,16 @@ enum ResponseType {
     Nonce = 4,
 }
 
+/// Response decoding profile.
+///
+/// Command encoding is shared by BM1366/BM1370 full-format BM13xx chips, but
+/// nonce responses differ in nonce byte order and job/subcore bit layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseProfile {
+    BM1366,
+    BM1370,
+}
+
 #[derive(Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub enum Response {
@@ -1058,7 +1115,10 @@ pub enum Response {
 }
 
 impl Response {
-    fn decode(bytes: &mut BytesMut) -> Result<Response, ProtocolError> {
+    fn decode_with_profile(
+        bytes: &mut BytesMut,
+        response_profile: ResponseProfile,
+    ) -> Result<Response, ProtocolError> {
         let type_and_crc = bytes[bytes.len() - 1].view_bits::<Lsb0>();
         let type_repr = type_and_crc[5..].load::<u8>();
 
@@ -1086,10 +1146,12 @@ impl Response {
                 }
             }
             Some(ResponseType::Nonce) => {
-                // BM1370 nonce response format (11 bytes total, including preamble):
+                // BM13xx nonce response format (11 bytes total, including preamble):
                 // Already consumed: preamble (2 bytes)
                 // Remaining: nonce(4) + midstate_num(1) + result_header(1) + version(2) + crc(1)
-                let nonce = bytes.get_u32_le();
+                let nonce = match response_profile {
+                    ResponseProfile::BM1366 | ResponseProfile::BM1370 => bytes.get_u32_le(),
+                };
                 let midstate_num = bytes.get_u8();
                 let result_header = bytes.get_u8();
 
@@ -1099,10 +1161,12 @@ impl Response {
                 let version = GeneralPurposeBits::from(version_bytes);
                 // CRC already consumed
 
-                // Extract job_id and subcore_id from result_header
-                // job_id is a 4-bit field (0-15) at bits 7-4 of result_header
-                let job_id = (result_header >> 4) & 0x0f;
-                let subcore_id = result_header & 0x0f;
+                // Extract job_id and subcore_id from result_header. BM1366
+                // uses a 5+3 split, while BM1370 uses a 4+4 split.
+                let (job_id, subcore_id) = match response_profile {
+                    ResponseProfile::BM1366 => ((result_header & 0xf8) >> 3, result_header & 0x07),
+                    ResponseProfile::BM1370 => ((result_header >> 4) & 0x0f, result_header & 0x0f),
+                };
 
                 Ok(Response::Nonce {
                     nonce,
@@ -1120,39 +1184,62 @@ impl Response {
 #[derive(Default)]
 pub struct FrameCodec;
 
+/// BM13xx frame codec with an explicit response profile.
+pub struct ProfiledFrameCodec {
+    response_profile: ResponseProfile,
+}
+
+impl ProfiledFrameCodec {
+    pub const fn new(response_profile: ResponseProfile) -> Self {
+        Self { response_profile }
+    }
+}
+
+fn encode_command_frame(command: Command, dst: &mut BytesMut) {
+    const PREAMBLE: [u8; 2] = [0x55, 0xaa];
+    dst.put_slice(&PREAMBLE);
+
+    let start_pos = dst.len();
+    command.encode(dst);
+
+    // Jobs use CRC16, other commands use CRC5
+    match &command {
+        Command::JobFull { .. } | Command::JobMidstate { .. } => {
+            // Calculate CRC16 over flags + length + data
+            let crc = crc16(&dst[start_pos..]);
+            // Wire format: CRC transmitted big-endian (high byte, low byte)
+            dst.put_slice(&crc.to_be_bytes());
+        }
+        _ => {
+            // Calculate CRC5 over everything after preamble
+            let crc = crc5(&dst[2..]);
+            dst.put_u8(crc);
+        }
+    }
+
+    // Log the encoded frame for debugging
+    trace!(
+        cmd = ?command,
+        bytes = dst.len(),
+        frame = %HexBytes(dst.as_ref()),
+        "TX BM13xx"
+    );
+}
+
 impl Encoder<Command> for FrameCodec {
     type Error = io::Error;
 
     fn encode(&mut self, command: Command, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        const PREAMBLE: [u8; 2] = [0x55, 0xaa];
-        dst.put_slice(&PREAMBLE);
+        encode_command_frame(command, dst);
+        Ok(())
+    }
+}
 
-        let start_pos = dst.len();
-        command.encode(dst);
+impl Encoder<Command> for ProfiledFrameCodec {
+    type Error = io::Error;
 
-        // Jobs use CRC16, other commands use CRC5
-        match &command {
-            Command::JobFull { .. } | Command::JobMidstate { .. } => {
-                // Calculate CRC16 over flags + length + data
-                let crc = crc16(&dst[start_pos..]);
-                // Wire format: CRC transmitted big-endian (high byte, low byte)
-                dst.put_slice(&crc.to_be_bytes());
-            }
-            _ => {
-                // Calculate CRC5 over everything after preamble
-                let crc = crc5(&dst[2..]);
-                dst.put_u8(crc);
-            }
-        }
-
-        // Log the encoded frame for debugging
-        trace!(
-            cmd = ?command,
-            bytes = dst.len(),
-            frame = %HexBytes(dst.as_ref()),
-            "TX BM13xx"
-        );
-
+    fn encode(&mut self, command: Command, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        encode_command_frame(command, dst);
         Ok(())
     }
 }
@@ -1162,76 +1249,92 @@ impl Decoder for FrameCodec {
     type Error = io::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        // Return Ok(Item) with a valid frame, or Ok(None) if to be called again, potentially with
-        // more data. Returning an Error causes the stream to be terminated, so don't do that.
-        //
-        // There are three cases:
-        //
-        // 1. More data needed
-        // 2. Invalid frame
-        // 3. Valid frame
-        //
-        // In the case of an invalid frame, consume the first byte and request another call by
-        // returning Ok(None). In the case of a valid frame, consume that frame's worth of bytes.
+        decode_frame(src, ResponseProfile::BM1370)
+    }
+}
 
-        const PREAMBLE: [u8; 2] = [0xaa, 0x55];
-        // All BM13xx responses are 11 bytes (2 preamble + 9 data)
-        const FRAME_LEN: usize = PREAMBLE.len() + 9;
-        const CALL_AGAIN: Result<Option<Response>, io::Error> = Ok(None);
+impl Decoder for ProfiledFrameCodec {
+    type Item = Response;
+    type Error = io::Error;
 
-        if src.len() < FRAME_LEN {
-            return CALL_AGAIN;
-        }
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        decode_frame(src, self.response_profile)
+    }
+}
 
-        // Check preamble without consuming the buffer
-        if src[0] != PREAMBLE[0] {
-            src.advance(1);
-            return CALL_AGAIN;
-        }
+fn decode_frame(
+    src: &mut BytesMut,
+    response_profile: ResponseProfile,
+) -> Result<Option<Response>, io::Error> {
+    // Return Ok(Item) with a valid frame, or Ok(None) if to be called again, potentially with
+    // more data. Returning an Error causes the stream to be terminated, so don't do that.
+    //
+    // There are three cases:
+    //
+    // 1. More data needed
+    // 2. Invalid frame
+    // 3. Valid frame
+    //
+    // In the case of an invalid frame, consume the first byte and request another call by
+    // returning Ok(None). In the case of a valid frame, consume that frame's worth of bytes.
 
-        if src[1] != PREAMBLE[1] {
-            src.advance(1);
-            return CALL_AGAIN;
-        }
+    const PREAMBLE: [u8; 2] = [0xaa, 0x55];
+    // All BM13xx responses are 11 bytes (2 preamble + 9 data)
+    const FRAME_LEN: usize = PREAMBLE.len() + 9;
+    const CALL_AGAIN: Result<Option<Response>, io::Error> = Ok(None);
 
-        // Validate CRC5 over the entire frame (excluding preamble)
-        // CRC5 is computed over the 9 data bytes after the preamble
-        if !crc5_is_valid(&src[2..FRAME_LEN]) {
+    if src.len() < FRAME_LEN {
+        return CALL_AGAIN;
+    }
+
+    // Check preamble without consuming the buffer
+    if src[0] != PREAMBLE[0] {
+        src.advance(1);
+        return CALL_AGAIN;
+    }
+
+    if src[1] != PREAMBLE[1] {
+        src.advance(1);
+        return CALL_AGAIN;
+    }
+
+    // Validate CRC5 over the entire frame (excluding preamble)
+    // CRC5 is computed over the 9 data bytes after the preamble
+    if !crc5_is_valid(&src[2..FRAME_LEN]) {
+        trace!(
+            "Frame sync lost: CRC5 failed for potential frame at position 0. Searching for next frame..."
+        );
+        src.advance(1);
+        return CALL_AGAIN;
+    }
+
+    // We have a valid frame with correct CRC
+    // Save the frame bytes before consuming
+    let frame_bytes = src[..FRAME_LEN].to_vec();
+
+    // Create a buffer for decoding
+    let mut decode_buf = BytesMut::from(&src[..FRAME_LEN]);
+    decode_buf.advance(2); // Skip preamble for Response::decode
+
+    match Response::decode_with_profile(&mut decode_buf, response_profile) {
+        Ok(response) => {
+            // Only advance if decode was successful
+            src.advance(FRAME_LEN);
+
+            // Log the received frame for debugging
             trace!(
-                "Frame sync lost: CRC5 failed for potential frame at position 0. Searching for next frame..."
+                resp = ?response,
+                bytes = FRAME_LEN,
+                frame = %HexBytes(&frame_bytes),
+                "RX BM13xx"
             );
-            src.advance(1);
-            return CALL_AGAIN;
+            Ok(Some(response))
         }
-
-        // We have a valid frame with correct CRC
-        // Save the frame bytes before consuming
-        let frame_bytes = src[..FRAME_LEN].to_vec();
-
-        // Create a buffer for decoding
-        let mut decode_buf = BytesMut::from(&src[..FRAME_LEN]);
-        decode_buf.advance(2); // Skip preamble for Response::decode
-
-        match Response::decode(&mut decode_buf) {
-            Ok(response) => {
-                // Only advance if decode was successful
-                src.advance(FRAME_LEN);
-
-                // Log the received frame for debugging
-                trace!(
-                    resp = ?response,
-                    bytes = FRAME_LEN,
-                    frame = %HexBytes(&frame_bytes),
-                    "RX BM13xx"
-                );
-                Ok(Some(response))
-            }
-            Err(err) => {
-                warn!("Failed to decode response: {}", err);
-                // Advance by 1 to try to find next valid frame
-                src.advance(1);
-                CALL_AGAIN
-            }
+        Err(err) => {
+            warn!("Failed to decode response: {}", err);
+            // Advance by 1 to try to find next valid frame
+            src.advance(1);
+            CALL_AGAIN
         }
     }
 }
@@ -1617,6 +1720,20 @@ mod command_tests {
     }
 
     #[test]
+    fn write_s19xp_luxos_nonce_range_from_register_value() {
+        assert_frame_eq(
+            Command::WriteRegister {
+                broadcast: true,
+                chip_address: 0x00,
+                register: Register::NonceRange(NonceRangeConfig::from_register_value(0x0000_1446)),
+            },
+            &[
+                0x55, 0xaa, 0x51, 0x09, 0x00, 0x10, 0x00, 0x00, 0x14, 0x46, 0x04,
+            ],
+        );
+    }
+
+    #[test]
     fn job_full_format_encoding() {
         use bitcoin::CompactTarget;
 
@@ -1818,6 +1935,44 @@ mod response_tests {
     use bytes::BufMut;
 
     #[test]
+    fn s19xp_bm1366_nonce_is_little_endian() {
+        use crate::job_source::GeneralPurposeBits;
+        use crate::types::Difficulty;
+        use bitcoin::block::Header as BlockHeader;
+        use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
+        use std::str::FromStr;
+
+        let prev_block_hash =
+            BlockHash::from_str("00000000000000000001851731982bfdf47d5858832ebc284f9dc14957b8d111")
+                .unwrap();
+        let merkle_root = TxMerkleNode::from_str(
+            "3ed6c69c817076115029b8f4cd859ce5e0229cd6a3917be94a11e97dbc11d06a",
+        )
+        .unwrap();
+        let base_version = bitcoin::block::Version::from_consensus(0x2000_0000);
+        let bits = CompactTarget::from_consensus(0x1702_068f);
+        let time = 0x6a19_a394;
+
+        let nonce_bytes = [0x40, 0x14, 0x34, 0x32];
+        let version_bytes = [0x02, 0xac];
+        let header = BlockHeader {
+            version: GeneralPurposeBits::new(version_bytes).apply_to_version(base_version),
+            prev_blockhash: prev_block_hash,
+            merkle_root,
+            time,
+            bits,
+            nonce: u32::from_le_bytes(nonce_bytes),
+        };
+        let difficulty = Difficulty::from_hash(&header.block_hash()).as_u64();
+
+        assert_eq!(u32::from_le_bytes(nonce_bytes), 0x3234_1440);
+        assert!(
+            (700..=800).contains(&difficulty),
+            "captured S19XP nonce should reconstruct as a real low-difficulty hash, got {difficulty}"
+        );
+    }
+
+    #[test]
     fn verify_crc_calculation() {
         // Test that our known good frame has valid CRC
         let frame = &[0x13, 0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10]; // without preamble
@@ -1882,6 +2037,12 @@ mod response_tests {
         codec.decode(&mut buf).expect("Failed to decode frame")
     }
 
+    fn decode_frame_with_profile(frame: &[u8], profile: ResponseProfile) -> Option<Response> {
+        let mut buf = BytesMut::from(frame);
+        let mut codec = ProfiledFrameCodec::new(profile);
+        codec.decode(&mut buf).expect("Failed to decode frame")
+    }
+
     #[test]
     fn decode_nonce_response_from_capture() {
         // From Bitaxe capture: RX: AA 55 18 00 A6 40 02 99 22 F9 91
@@ -1915,6 +2076,35 @@ mod response_tests {
         // Verify main core extraction
         let main_core = (nonce >> 25) & 0x7f;
         assert_eq!(main_core, 32);
+    }
+
+    #[test]
+    fn decode_bm1366_nonce_response_from_s19_capture() {
+        // Example BM1362/BM1366-family response from protocol notes:
+        // nonce is little-endian on these chips, and result_header uses
+        // the upper 5 bits for job ID plus lower 3 bits for subcore ID.
+        let wire = &[
+            0xaa, 0x55, 0x6d, 0xb8, 0x8e, 0xe1, 0x01, 0x04, 0x03, 0x54, 0x94,
+        ];
+        let response = decode_frame_with_profile(wire, ResponseProfile::BM1366)
+            .expect("decode_frame should return Some for valid frame");
+
+        let Response::Nonce {
+            nonce,
+            job_id,
+            midstate_num,
+            version,
+            subcore_id,
+        } = response
+        else {
+            panic!("Expected nonce response");
+        };
+
+        assert_eq!(nonce, 0xe18eb86d);
+        assert_eq!(midstate_num, 0x01);
+        assert_eq!(job_id, 0);
+        assert_eq!(subcore_id, 4);
+        assert_eq!(version, GeneralPurposeBits::new([0x03, 0x54]));
     }
 
     #[test]

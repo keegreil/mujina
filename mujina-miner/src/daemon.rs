@@ -15,6 +15,7 @@ use crate::{
     api::{self, ApiConfig, commands::SchedulerCommand},
     asic::hash_thread::HashThread,
     backplane::Backplane,
+    board::antminer_s19xp_amlogic,
     cpu_miner::CpuMinerConfig,
     job_source::{
         SourceCommand, SourceEvent,
@@ -24,8 +25,11 @@ use crate::{
     },
     scheduler::{self, SourceRegistration},
     stratum_v1::{PoolConfig as StratumPoolConfig, TcpConnector},
-    transport::{CpuDeviceInfo, TransportEvent, UsbTransport, cpu as cpu_transport},
+    transport::{CpuDeviceInfo, TransportEvent, cpu as cpu_transport},
 };
+
+#[cfg(feature = "usb")]
+use crate::transport::UsbTransport;
 
 /// The main daemon.
 pub struct Daemon {
@@ -50,6 +54,7 @@ impl Daemon {
         let (source_reg_tx, source_reg_rx) = mpsc::channel::<SourceRegistration>(10);
 
         // Create and start USB transport discovery
+        #[cfg(feature = "usb")]
         if std::env::var("MUJINA_USB_DISABLE").is_err() {
             let usb_transport = UsbTransport::new(transport_tx.clone());
             if let Err(e) = usb_transport.start_discovery(self.shutdown.clone()).await {
@@ -58,6 +63,9 @@ impl Daemon {
         } else {
             info!("USB discovery disabled (MUJINA_USB_DISABLE set)");
         }
+
+        #[cfg(not(feature = "usb"))]
+        info!("USB discovery unavailable (built without the usb feature)");
 
         // Inject CPU miner virtual device if configured
         if let Some(config) = CpuMinerConfig::from_env() {
@@ -81,6 +89,54 @@ impl Daemon {
         // Board registration channel: backplane forwards board
         // registrations here, the API server collects and serves them.
         let (board_reg_tx, board_reg_rx) = mpsc::channel(10);
+
+        if let Ok(local_board) = env::var("MUJINA_LOCAL_BOARD") {
+            match local_board.as_str() {
+                "s19xp-amlogic" => {
+                    let conn = antminer_s19xp_amlogic::create_from_env().await?;
+                    let crate::board::BackplaneConnector {
+                        info,
+                        threads,
+                        telemetry_rx,
+                        shutdown,
+                    } = conn;
+                    let board_id = info
+                        .serial_number
+                        .clone()
+                        .unwrap_or_else(|| "s19xp-amlogic".to_string());
+
+                    board_reg_tx
+                        .send(api::BoardRegistration { telemetry_rx })
+                        .await?;
+
+                    info!(
+                        board = %info.model,
+                        serial = %board_id,
+                        threads = threads.len(),
+                        "Local board started."
+                    );
+
+                    for thread in threads {
+                        if thread_tx.send(thread).await.is_err() {
+                            anyhow::bail!("failed to send local board thread to scheduler");
+                        }
+                    }
+
+                    if let Some(shutdown) = shutdown {
+                        self.tracker.spawn({
+                            let shutdown_token = self.shutdown.clone();
+                            async move {
+                                shutdown_token.cancelled().await;
+                                shutdown.await;
+                            }
+                        });
+                    }
+                }
+                other => {
+                    anyhow::bail!("unsupported MUJINA_LOCAL_BOARD={other}; expected s19xp-amlogic");
+                }
+            }
+        }
 
         // Create and start backplane
         let mut backplane = Backplane::new(transport_rx, thread_tx, board_reg_tx);

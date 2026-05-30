@@ -9,6 +9,7 @@ use anyhow::Result;
 
 pub mod cpu;
 pub mod serial;
+#[cfg(feature = "usb")]
 pub mod usb;
 
 // Re-export transport implementations
@@ -17,12 +18,14 @@ pub use serial::{
     Parity, SerialConfig, SerialControl, SerialError, SerialReader, SerialStats, SerialStream,
     SerialWriter,
 };
+#[cfg(feature = "usb")]
 pub use usb::{UsbDeviceInfo, UsbTransport};
 
 /// Generic transport event that can represent different transport types.
 #[derive(Debug)]
 pub enum TransportEvent {
     /// USB device event
+    #[cfg(feature = "usb")]
     Usb(usb::TransportEvent),
 
     /// CPU miner virtual device event

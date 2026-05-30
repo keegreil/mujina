@@ -14,17 +14,21 @@ use futures::future::BoxFuture;
 use crate::{
     api::BoardRegistration,
     asic::hash_thread::HashThread,
-    board::{BackplaneConnector, BoardDescriptor, BoardInfo, VirtualBoardRegistry},
+    board::{BackplaneConnector, BoardInfo, VirtualBoardRegistry},
     tracing::prelude::*,
-    transport::{
-        TransportEvent, UsbDeviceInfo, cpu::TransportEvent as CpuTransportEvent,
-        usb::TransportEvent as UsbTransportEvent,
-    },
+    transport::{TransportEvent, cpu::TransportEvent as CpuTransportEvent},
 };
 
+#[cfg(feature = "usb")]
+use crate::board::BoardDescriptor;
+#[cfg(feature = "usb")]
+use crate::transport::{UsbDeviceInfo, usb::TransportEvent as UsbTransportEvent};
+
 /// Board registry that uses inventory to find registered boards.
+#[cfg(feature = "usb")]
 pub struct BoardRegistry;
 
+#[cfg(feature = "usb")]
 impl BoardRegistry {
     /// Find the best matching board descriptor for this USB device.
     ///
@@ -46,6 +50,7 @@ impl BoardRegistry {
 /// scheduler. Boards plug into the backplane, which routes their events and
 /// manages their lifecycle.
 pub struct Backplane {
+    #[cfg(feature = "usb")]
     registry: BoardRegistry,
     virtual_registry: VirtualBoardRegistry,
     /// Active boards managed by the backplane
@@ -65,6 +70,7 @@ impl Backplane {
         board_reg_tx: mpsc::Sender<BoardRegistration>,
     ) -> Self {
         Self {
+            #[cfg(feature = "usb")]
             registry: BoardRegistry,
             virtual_registry: VirtualBoardRegistry,
             boards: HashMap::new(),
@@ -78,6 +84,7 @@ impl Backplane {
     pub async fn run(&mut self) -> Result<()> {
         while let Some(event) = self.event_rx.recv().await {
             match event {
+                #[cfg(feature = "usb")]
                 TransportEvent::Usb(usb_event) => {
                     self.handle_usb_event(usb_event).await?;
                 }
@@ -146,6 +153,7 @@ impl Backplane {
     }
 
     /// Handle USB transport events.
+    #[cfg(feature = "usb")]
     async fn handle_usb_event(&mut self, event: UsbTransportEvent) -> Result<()> {
         match event {
             UsbTransportEvent::UsbDeviceConnected(device_info) => {

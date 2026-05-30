@@ -110,6 +110,37 @@ pub struct BM13xxThread {
     status: Arc<RwLock<HashThreadStatus>>,
 }
 
+/// Runtime configuration for a BM13xx hash thread.
+#[derive(Debug, Clone)]
+pub struct BM13xxThreadConfig {
+    /// Chip profile for init and response interpretation.
+    pub profile: protocol::ChipProfile,
+    /// Number of chips in the daisy-chain driven by this thread.
+    pub chain_length: usize,
+    /// Target hash clock in MHz.
+    pub target_frequency_mhz: f32,
+    /// Optional exact nonce range register value.
+    pub nonce_range: Option<protocol::NonceRangeConfig>,
+    /// Estimated thread hashrate used by the scheduler.
+    pub hashrate_estimate: HashRate,
+    /// ASIC ticket mask difficulty. If omitted, defaults to the historic
+    /// ~1 share/sec at 1 TH/s setting.
+    pub asic_difficulty: Option<Log2Difficulty>,
+}
+
+impl Default for BM13xxThreadConfig {
+    fn default() -> Self {
+        Self {
+            profile: protocol::ChipProfile::BM1370,
+            chain_length: 1,
+            target_frequency_mhz: 525.0,
+            nonce_range: None,
+            hashrate_estimate: HashRate::from_terahashes(1.0),
+            asic_difficulty: None,
+        }
+    }
+}
+
 impl BM13xxThread {
     /// Create a new BM13xx thread with Stream/Sink for chip communication
     ///
@@ -134,11 +165,36 @@ impl BM13xxThread {
         W: Sink<protocol::Command> + Unpin + Send + 'static,
         W::Error: std::fmt::Debug,
     {
+        Self::new_with_config(
+            name,
+            chip_responses,
+            chip_commands,
+            peripherals,
+            removal_rx,
+            BM13xxThreadConfig::default(),
+        )
+    }
+
+    /// Create a new BM13xx thread with explicit chip/chain configuration.
+    pub fn new_with_config<R, W>(
+        name: String,
+        chip_responses: R,
+        chip_commands: W,
+        peripherals: BoardPeripherals,
+        removal_rx: watch::Receiver<ThreadRemovalSignal>,
+        config: BM13xxThreadConfig,
+    ) -> Self
+    where
+        R: Stream<Item = Result<protocol::Response, std::io::Error>> + Unpin + Send + 'static,
+        W: Sink<protocol::Command> + Unpin + Send + 'static,
+        W::Error: std::fmt::Debug,
+    {
         let (cmd_tx, cmd_rx) = mpsc::channel(10);
         let (evt_tx, evt_rx) = mpsc::channel(100);
 
         let status = Arc::new(RwLock::new(HashThreadStatus::default()));
         let status_clone = Arc::clone(&status);
+        let hashrate_estimate = config.hashrate_estimate;
 
         // Spawn the actor task
         tokio::spawn(async move {
@@ -150,6 +206,7 @@ impl BM13xxThread {
                 chip_responses,
                 chip_commands,
                 peripherals,
+                config,
             )
             .await;
         });
@@ -158,9 +215,7 @@ impl BM13xxThread {
             name,
             command_tx: cmd_tx,
             event_rx: Some(evt_rx),
-            capabilities: HashThreadCapabilities {
-                hashrate_estimate: HashRate::from_terahashes(1.0), // Stub
-            },
+            capabilities: HashThreadCapabilities { hashrate_estimate },
             status,
         }
     }
@@ -237,6 +292,7 @@ async fn initialize_chip<W>(
     chip_commands: &mut W,
     peripherals: &mut BoardPeripherals,
     asic_difficulty: Log2Difficulty,
+    config: &BM13xxThreadConfig,
 ) -> Result<()>
 where
     W: Sink<protocol::Command> + Unpin,
@@ -269,6 +325,172 @@ where
             })
             .await
             .map_err(|e| anyhow!("{e:?}"))
+    }
+
+    if config.profile == protocol::ChipProfile::BM1366 {
+        debug!(
+            chain_length = config.chain_length,
+            target_frequency_mhz = config.target_frequency_mhz,
+            "Sending BM1366/S19XP initialization sequence"
+        );
+
+        for _ in 1..=3 {
+            send_reg(
+                chip_commands,
+                true,
+                Register::VersionMask(protocol::VersionMask::full_rolling()),
+            )
+            .await
+            .context("failed to send version mask")?;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        send_reg(
+            chip_commands,
+            true,
+            Register::InitControl {
+                raw_value: 0x0000_0700,
+            },
+        )
+        .await?;
+        send_reg(
+            chip_commands,
+            true,
+            Register::MiscControl {
+                raw_value: 0x00C1_0FFF,
+            },
+        )
+        .await?;
+
+        chip_commands
+            .send(Command::ChainInactive)
+            .await
+            .map_err(|e| anyhow!("{e:?}"))
+            .context("failed to send ChainInactive")?;
+
+        let chain_length = config.chain_length.max(1);
+        let address_interval = (256 / chain_length).max(1) as u8;
+        for chip_idx in 0..chain_length {
+            chip_commands
+                .send(Command::SetChipAddress {
+                    chip_address: (chip_idx as u8).wrapping_mul(address_interval),
+                })
+                .await
+                .map_err(|e| anyhow!("{e:?}"))
+                .context("failed to send SetChipAddress")?;
+        }
+
+        send_reg(
+            chip_commands,
+            true,
+            Register::Core {
+                raw_value: 0x8000_8540,
+            },
+        )
+        .await?;
+        send_reg(
+            chip_commands,
+            true,
+            Register::Core {
+                raw_value: 0x8000_8020,
+            },
+        )
+        .await?;
+        send_reg(
+            chip_commands,
+            true,
+            Register::TicketMask(TicketMask::new(asic_difficulty)),
+        )
+        .await?;
+        send_reg(
+            chip_commands,
+            true,
+            Register::AnalogMux {
+                raw_value: 0x0300_0000,
+            },
+        )
+        .await?;
+        send_reg(
+            chip_commands,
+            true,
+            Register::IoDriverStrength(protocol::IoDriverStrength::bm1366_normal()),
+        )
+        .await?;
+        send_reg(
+            chip_commands,
+            false,
+            Register::UartRelay {
+                raw_value: 0x0300_7C00,
+            },
+        )
+        .await?;
+
+        for chip_idx in 0..chain_length {
+            let chip_address = (chip_idx as u8).wrapping_mul(address_interval);
+
+            chip_commands
+                .send(Command::WriteRegister {
+                    broadcast: false,
+                    chip_address,
+                    register: Register::InitControl {
+                        raw_value: 0xF001_0700,
+                    },
+                })
+                .await
+                .map_err(|e| anyhow!("{e:?}"))?;
+            chip_commands
+                .send(Command::WriteRegister {
+                    broadcast: false,
+                    chip_address,
+                    register: Register::MiscControl {
+                        raw_value: 0x00C1_00F0,
+                    },
+                })
+                .await
+                .map_err(|e| anyhow!("{e:?}"))?;
+            for raw_value in [0x8000_8540, 0x8000_8020, 0x8000_82AA] {
+                chip_commands
+                    .send(Command::WriteRegister {
+                        broadcast: false,
+                        chip_address,
+                        register: Register::Core { raw_value },
+                    })
+                    .await
+                    .map_err(|e| anyhow!("{e:?}"))?;
+            }
+        }
+
+        debug!(
+            target_frequency_mhz = config.target_frequency_mhz,
+            "Ramping BM1366 frequency"
+        );
+        let frequency_steps = generate_frequency_ramp_steps_for_profile(
+            config.profile,
+            56.25,
+            config.target_frequency_mhz,
+            6.25,
+        );
+        for pll_config in frequency_steps {
+            send_reg(chip_commands, true, Register::PllDivider(pll_config))
+                .await
+                .context("PLL ramp failed")?;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        let nonce_range = config
+            .nonce_range
+            .unwrap_or_else(|| protocol::NonceRangeConfig::from_register_value(0x0000_1446));
+        send_reg(chip_commands, true, Register::NonceRange(nonce_range)).await?;
+        send_reg(
+            chip_commands,
+            true,
+            Register::VersionMask(protocol::VersionMask::full_rolling()),
+        )
+        .await?;
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        return Ok(());
     }
 
     // Send version mask configuration (3 times)
@@ -427,9 +649,12 @@ where
     )
     .await?;
 
-    // Frequency ramping (56.25 MHz -> 525 MHz)
-    debug!("Ramping frequency from 56.25 MHz to 525 MHz");
-    let frequency_steps = generate_frequency_ramp_steps(56.25, 525.0, 6.25);
+    // Frequency ramping (56.25 MHz -> target)
+    debug!(
+        target_frequency_mhz = config.target_frequency_mhz,
+        "Ramping frequency"
+    );
+    let frequency_steps = generate_frequency_ramp_steps(56.25, config.target_frequency_mhz, 6.25);
 
     for (i, pll_config) in frequency_steps.iter().enumerate() {
         send_reg(chip_commands, true, Register::PllDivider(*pll_config))
@@ -449,7 +674,11 @@ where
     send_reg(
         chip_commands,
         true,
-        Register::NonceRange(protocol::NonceRangeConfig::from_raw(0xB51E0000)),
+        Register::NonceRange(
+            config
+                .nonce_range
+                .unwrap_or_else(|| protocol::NonceRangeConfig::from_raw(0xB51E0000)),
+        ),
     )
     .await?;
     send_reg(
@@ -470,11 +699,25 @@ fn generate_frequency_ramp_steps(
     target_mhz: f32,
     step_mhz: f32,
 ) -> Vec<protocol::PllConfig> {
+    generate_frequency_ramp_steps_for_profile(
+        protocol::ChipProfile::BM1370,
+        start_mhz,
+        target_mhz,
+        step_mhz,
+    )
+}
+
+fn generate_frequency_ramp_steps_for_profile(
+    profile: protocol::ChipProfile,
+    start_mhz: f32,
+    target_mhz: f32,
+    step_mhz: f32,
+) -> Vec<protocol::PllConfig> {
     let mut configs = Vec::new();
     let mut current = start_mhz;
 
     while current <= target_mhz {
-        if let Some(config) = calculate_pll_for_frequency(current) {
+        if let Some(config) = calculate_pll_for_profile(profile, current) {
             configs.push(config);
         }
         current += step_mhz;
@@ -526,9 +769,22 @@ fn task_to_job_full(task: &HashTask, chip_job_id: u8) -> Result<protocol::JobFul
 }
 
 /// Calculate PLL configuration for a specific frequency
+#[cfg(test)]
 fn calculate_pll_for_frequency(target_freq: f32) -> Option<protocol::PllConfig> {
+    calculate_pll_for_profile(protocol::ChipProfile::BM1370, target_freq)
+}
+
+fn calculate_pll_for_profile(
+    profile: protocol::ChipProfile,
+    target_freq: f32,
+) -> Option<protocol::PllConfig> {
     const CRYSTAL_FREQ: f32 = 25.0;
     const MAX_FREQ_ERROR: f32 = 1.0;
+
+    let (fb_min, fb_max) = match profile {
+        protocol::ChipProfile::BM1366 => (144u8, 235u8),
+        protocol::ChipProfile::BM1370 => (0xa0u8, 0xefu8),
+    };
 
     let mut best_fb_div = 0u8;
     let mut best_ref_div = 0u8;
@@ -548,12 +804,17 @@ fn calculate_pll_for_frequency(target_freq: f32) -> Option<protocol::PllConfig> 
                 if best_fb_div != 0 {
                     break;
                 }
-                if post_div1 >= post_div2 {
+                let valid_post_div = match profile {
+                    protocol::ChipProfile::BM1366 => post_div1 > post_div2,
+                    protocol::ChipProfile::BM1370 => post_div1 >= post_div2,
+                };
+
+                if valid_post_div {
                     let fb_div_f = (post_div1 * post_div2) as f32 * target_freq * ref_div as f32
                         / CRYSTAL_FREQ;
                     let fb_div = fb_div_f.round() as u8;
 
-                    if (0xa0..=0xef).contains(&fb_div) {
+                    if (fb_min..=fb_max).contains(&fb_div) {
                         let actual_freq =
                             CRYSTAL_FREQ * fb_div as f32 / (ref_div * post_div1 * post_div2) as f32;
                         let error = (actual_freq - target_freq).abs();
@@ -602,6 +863,7 @@ async fn bm13xx_thread_actor<R, W>(
     mut chip_responses: R,
     mut chip_commands: W,
     mut peripherals: BoardPeripherals,
+    config: BM13xxThreadConfig,
 ) where
     R: Stream<Item = Result<protocol::Response, std::io::Error>> + Unpin,
     W: Sink<protocol::Command> + Unpin,
@@ -615,9 +877,11 @@ async fn bm13xx_thread_actor<R, W>(
     }
 
     // ASIC ticket mask difficulty: ~1 nonce/sec at 1 TH/s
-    let asic_difficulty = Log2Difficulty::from_difficulty(
-        ShareRate::per_second(1.0).to_difficulty(HashRate::from_terahashes(1.0)),
-    );
+    let asic_difficulty = config.asic_difficulty.unwrap_or_else(|| {
+        Log2Difficulty::from_difficulty(
+            ShareRate::per_second(1.0).to_difficulty(HashRate::from_terahashes(1.0)),
+        )
+    });
 
     let mut chip_initialized = false;
     let mut current_task: Option<HashTask> = None;
@@ -663,7 +927,7 @@ async fn bm13xx_thread_actor<R, W>(
 
                         if !chip_initialized {
                             trace!("Initializing chip on first assignment.");
-                            if let Err(e) = initialize_chip(&mut chip_commands, &mut peripherals, asic_difficulty).await {
+                            if let Err(e) = initialize_chip(&mut chip_commands, &mut peripherals, asic_difficulty, &config).await {
                                 error!(error = %e, "Chip initialization failed");
                                 response_tx.send(Err(e)).ok();
                                 continue;
@@ -713,7 +977,7 @@ async fn bm13xx_thread_actor<R, W>(
 
                         if !chip_initialized {
                             trace!("Initializing chip on first assignment.");
-                            if let Err(e) = initialize_chip(&mut chip_commands, &mut peripherals, asic_difficulty).await {
+                            if let Err(e) = initialize_chip(&mut chip_commands, &mut peripherals, asic_difficulty, &config).await {
                                 error!(error = %e, "Chip initialization failed");
                                 response_tx.send(Err(e)).ok();
                                 continue;
@@ -903,6 +1167,12 @@ async fn bm13xx_thread_actor<R, W>(
         }
     }
 
+    if let Some(ref mut asic_enable) = peripherals.asic_enable
+        && let Err(e) = asic_enable.disable().await
+    {
+        warn!(error = %e, "Failed to disable ASIC while exiting");
+    }
+
     debug!("BM13xx thread actor exiting");
 }
 
@@ -961,6 +1231,23 @@ mod tests {
                 calculated_freq
             );
         }
+    }
+
+    #[test]
+    fn test_bm1366_pll_calculation_for_s19xp_low_frequency() {
+        let config = calculate_pll_for_profile(protocol::ChipProfile::BM1366, 110.0)
+            .expect("Failed to calculate BM1366 PLL for 110 MHz");
+
+        assert_eq!(config.flag, 0x40);
+        assert_eq!(config.fb_div, 0xB9);
+        assert_eq!(config.ref_div, 0x02);
+        assert_eq!(config.post_div, 0x62);
+
+        let post_div1 = ((config.post_div >> 4) & 0xF) + 1;
+        let post_div2 = (config.post_div & 0xF) + 1;
+        let calculated_freq =
+            25.0 * config.fb_div as f32 / (config.ref_div * post_div1 * post_div2) as f32;
+        assert!((calculated_freq - 110.0).abs() < 1.0);
     }
 
     #[test]

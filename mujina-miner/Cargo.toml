@@ -20,7 +20,7 @@ crc_all = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
 inventory = { workspace = true }
-nusb = { workspace = true }
+nusb = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 strum = { workspace = true }
@@ -46,12 +46,12 @@ num-traits = { workspace = true }
 ruint = "1.17.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-core-foundation = { workspace = true }
-io-kit-sys = { workspace = true }
+core-foundation = { workspace = true, optional = true }
+io-kit-sys = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tracing-journald = { workspace = true }
-udev = { workspace = true }
+udev = { workspace = true, optional = true }
 
 [[bin]]
 name = "mujina-minerd"
@@ -66,7 +66,8 @@ name = "mujina-tui"
 path = "src/bin/tui.rs"
 
 [features]
-default = []
+default = ["usb"]
+usb = ["dep:nusb", "dep:udev", "dep:core-foundation", "dep:io-kit-sys"]
 skip-pty-tests = []  # Skip PTY-based serial tests that may hang in some environments
 
 [dev-dependencies]

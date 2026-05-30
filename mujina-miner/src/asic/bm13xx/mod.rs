@@ -12,7 +12,7 @@ pub mod thread;
 pub mod test_data;
 
 // Re-export commonly used types
-pub use protocol::{FrameCodec, Register, Response};
+pub use protocol::{FrameCodec, ProfiledFrameCodec, Register, Response, ResponseProfile};
 
 // Re-export the protocol handler
 pub use protocol::BM13xxProtocol;

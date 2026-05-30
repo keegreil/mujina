@@ -1,15 +1,20 @@
+pub(crate) mod antminer_s19xp_amlogic;
+#[cfg(feature = "usb")]
 pub(crate) mod bitaxe;
 pub(crate) mod cpu;
+#[cfg(feature = "usb")]
 pub(crate) mod emberone00;
+#[cfg(feature = "usb")]
 pub mod pattern;
 
 use anyhow::Result;
 use futures::future::BoxFuture;
 use tokio::sync::watch;
 
-use crate::{
-    api_client::types::BoardTelemetry, asic::hash_thread::HashThread, transport::UsbDeviceInfo,
-};
+use crate::{api_client::types::BoardTelemetry, asic::hash_thread::HashThread};
+
+#[cfg(feature = "usb")]
+use crate::transport::UsbDeviceInfo;
 
 /// Returned by board factory functions with everything the backplane
 /// needs to integrate a board into the system.
@@ -52,6 +57,7 @@ pub struct BoardInfo {
 ///
 /// The backplane calls the factory when a matching USB device is
 /// discovered.
+#[cfg(feature = "usb")]
 pub type BoardFactoryFn = fn(UsbDeviceInfo) -> BoxFuture<'static, Result<BackplaneConnector>>;
 
 /// Board descriptor that gets collected by inventory.
@@ -66,6 +72,7 @@ pub type BoardFactoryFn = fn(UsbDeviceInfo) -> BoxFuture<'static, Result<Backpla
 /// When multiple descriptors match a device, the one with the highest specificity
 /// score is selected. This allows generic fallback handlers while ensuring
 /// specific boards are matched correctly.
+#[cfg(feature = "usb")]
 pub struct BoardDescriptor {
     /// Pattern for matching USB devices
     pub pattern: pattern::BoardPattern,
@@ -76,6 +83,7 @@ pub struct BoardDescriptor {
 }
 
 // This creates the inventory collection for board descriptors
+#[cfg(feature = "usb")]
 inventory::collect!(BoardDescriptor);
 
 /// Factory function signature for creating a virtual board.
